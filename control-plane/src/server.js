@@ -40,6 +40,8 @@ import { generateKeyPair, encryptPrivate, invalidateSigningCache, ensureKeyPair,
 import { ensureStream, iceServers, turnCredentials, mintTurn, supportsRtsp, GO2RTC_URL } from './go2rtc.js';
 import { setSink, sinkConfigured, shipServer } from './logship.js';
 import { dbg } from './debuglog.js';
+import { fetchLinkPrinters, linkConfigured } from './link.js';
+import { desktopSettings, inboxFor, inboxName, sendToInbox } from './desktop.js';
 import { engineBaseOf, singleTenant, engineUrl } from './tenancy.js';
 import { teamMode, ACCESS_SETTING, parseAccessMap, accessFor, inTeam, allows, onlyPrinter, isAll,
   checkEngineRequest, filterEngineAnswer, filterPrinters, answerHidden } from './team.js';
@@ -287,6 +289,8 @@ app.get('/api/slicer/info', async (req, reply) => {
     desktop_url: DESKTOP_URL ? DESKTOP_URL + '/' : null,
     print_host: PUBLIC_URL ? PUBLIC_URL + '/printhost' : null,
     desktop_print_host: DESKTOP_URL ? (DESKTOP_PRINTHOST || null) : null,
+    // Whether "Open in OrcaSlicer" can send a file to the desktop (B49).
+    desktop_open: Boolean(DESKTOP_URL && desktopSettings().inbox),
     print_host_keys: await countPrintHostTokens(actorOf(user).id, 'slicer').catch(() => 0)
   };
 });
@@ -301,6 +305,42 @@ app.post('/api/slicer/printhost-key', async (req, reply) => {
   const token = randomBytes(24).toString('base64url');
   await createPrintHostToken(actorOf(user).id, token, 'orcaslicer', null);
   return { url: PUBLIC_URL + '/printhost', api_key: token, host_type: 'octoprint' };
+});
+
+// Open in OrcaSlicer (B49, desktop.js): a file from the library goes to the person's OrcaSlicer desktop, which
+// opens it. The desktop is the one the proxy's sign-in says is theirs (X-authentik-username), or the shared one.
+app.post('/api/slicer/desktop-open', async (req, reply) => {
+  const user = await requireUser(req, reply); if (!user) return;
+  const settings = desktopSettings();
+  if (!DESKTOP_URL || !settings.inbox) return reply.code(404).send({ error: 'there is no OrcaSlicer desktop here' });
+  const gatewayOk = !GATEWAY_SECRET || req.headers['x-ophq-gateway'] === GATEWAY_SECRET;
+  const login = gatewayOk ? req.headers['x-authentik-username'] : null;
+  const dir = inboxFor(settings, login);
+  if (!dir) return reply.code(409).send({ error: 'no OrcaSlicer desktop of yours to open it in' });
+  const id = Number(req.body?.file_id);
+  if (!Number.isInteger(id) || id <= 0) return reply.code(400).send({ error: 'file_id is required' });
+  const name = inboxName(req.body?.name);
+  if (!name) return reply.code(400).send({ error: 'OrcaSlicer opens 3MF, STL, OBJ, STEP, AMF, SVG and G-code files' });
+  const inst = await getInstanceForUser(user.id);
+  const base = engineBase(inst);
+  if (!base) return reply.code(409).send({ error: 'no running instance for this account' });
+  const r = await fetch(base + '/api/v1/library/files/' + id + '/download');
+  if (!r.ok) return reply.code(r.status === 404 ? 404 : 502).send({ error: 'the library did not give the file' });
+  await sendToInbox(dir, name, Buffer.from(await r.arrayBuffer()));
+  dbg('slicer', 'file sent to the OrcaSlicer desktop', { userId: user.id, fileId: id, shared: !settings.perPerson });
+  return { sent: name, desktop_url: DESKTOP_URL + '/' };
+});
+
+// ArtisanHub Link's printers (B48, link.js), for the add-printer page: what a scan from here cannot find when
+// the farm runs away from its printers. Owners only, as adding printers is.
+app.get('/api/link/printers', async (req, reply) => {
+  const user = await requireOwner(req, reply); if (!user) return;
+  if (!linkConfigured()) return { enabled: false, printers: [] };
+  try {
+    return await fetchLinkPrinters();
+  } catch (e) {
+    return reply.code(502).send({ error: 'ArtisanHub Link did not answer: ' + (e.message || e) });
+  }
 });
 
 // ---- print host (OctoPrint-compatible) ----------------------------------
@@ -2058,6 +2098,66 @@ app.get('/api/camera-relay/:printerId/frame', async (req, reply) => {
   return relayCameraFrame(user.id, pid, reply);
 });
 
+// Live video over the page's own HTTPS connection (B51): fragmented MP4 that the browser plays with Media Source
+// Extensions, carried on a WebSocket to go2rtc's /api/ws. WebRTC needs a UDP path or a TURN relay to the farm,
+// which a farm on a cloud machine behind its proxy does not have (only 80 and 443 reach it), so without this the
+// page fell back to a still frame a minute. The same sign-in and per-person printer access as the rest of the
+// farm, checked before the upgrade; the stream is one of the printer's own cameras, never a source from the
+// browser. go2rtc speaks its own small protocol on it ({"type":"mse",...}); this only carries it both ways.
+// The camera a printer's viewer shows: the one ?stream= names, or else the printer's first camera that is
+// switched on (its own, then the engine's, then any added by URL). So switching a printer's own camera off,
+// say a 1080p MJPEG webcam, and adding its H.264 restream makes the restream what everyone sees.
+async function cameraStreamFor(req, user, pid) {
+  const inst = await getInstanceForUser(user.id);
+  if (!inst) return null;
+  const wanted = String(req.query?.stream || '');
+  let cam = null;
+  try {
+    const mine = (await cameraList({ base: engineBase(inst), inst, userId: user.id }, { withSource: true }))
+      .filter((c) => c.printer_id === Number(pid) && c.enabled);
+    cam = wanted ? mine.find((c) => c.stream_name === wanted) : mine[0];
+  } catch { /* engine down */ }
+  if (!cam) return wanted ? null : ensureStream(inst, user.id, pid);
+  return await registerStream(cam.stream_name, cam._source).catch(() => false) ? cam.stream_name : null;
+}
+
+app.get('/api/camera/mse/:printerId', {
+  websocket: true,
+  preValidation: async (req, reply) => {
+    const user = await requireUser(req, reply); if (!user) return;
+    const pid = String(req.params.printerId).replace(/[^0-9]/g, '');
+    if (!pid) return reply.code(400).send({ error: 'bad printer id' });
+    if (await denyPrinter(req, reply, user, pid)) return;
+    const name = await cameraStreamFor(req, user, pid);
+    if (!name) return reply.code(404).send({ error: 'no camera stream for this printer' });
+    req.cameraStream = name;
+  }
+}, (socket, req) => {
+  const upstream = new WebSocket(`${GO2RTC_URL.replace(/^http/, 'ws')}/api/ws?src=${encodeURIComponent(req.cameraStream)}`);
+  upstream.binaryType = 'arraybuffer';
+  const pending = [];
+  const close = () => { try { upstream.close(); } catch { /* */ } try { socket.close(); } catch { /* */ } };
+  upstream.onopen = () => { for (const m of pending.splice(0)) upstream.send(m); };
+  upstream.onmessage = (e) => {
+    if (socket.readyState !== 1) return;
+    // A slow browser must not make this server hold a growing backlog of video: past a few seconds of it,
+    // drop the connection and let the page connect again at the live edge.
+    if (socket.bufferedAmount > 8 * 1024 * 1024) return close();
+    socket.send(typeof e.data === 'string' ? e.data : Buffer.from(e.data));
+  };
+  upstream.onerror = close;
+  upstream.onclose = close;
+  socket.on('message', (data, isBinary) => {
+    // Only go2rtc's own control messages go up: small JSON text, never media.
+    if (isBinary || data.length > 4096) return;
+    const text = data.toString();
+    if (upstream.readyState === 1) upstream.send(text); else pending.push(text);
+  });
+  socket.on('close', close);
+  socket.on('error', close);
+  dbg('camera', 'mse stream', { stream: req.cameraStream });
+});
+
 app.post('/api/camera/webrtc/:printerId', async (req, reply) => {
   const user = await requireUser(req, reply); if (!user) return;
   if (await denyPrinter(req, reply, user, String(req.params.printerId).replace(/[^0-9]/g, ''))) return;
@@ -2142,17 +2242,8 @@ app.post('/api/camera/webrtc/:printerId', async (req, reply) => {
 
   // Local (same-network) printers: the cloud go2rtc can reach them directly.
   // ?stream= picks one of the printer's named cameras (GET /api/cameras); without
-  // it, the printer's own camera.
-  let name = null;
-  const wanted = String(req.query?.stream || '');
-  if (wanted) {
-    let cam = null;
-    try { cam = (await cameraList({ base: engineBase(inst), inst, userId: user.id }, { withSource: true }))
-      .find((c) => c.stream_name === wanted && c.printer_id === Number(pid) && c.enabled); } catch { /* engine down */ }
-    if (cam && await registerStream(cam.stream_name, cam._source).catch(() => false)) name = cam.stream_name;
-  } else {
-    name = await ensureStream(inst, user.id, pid);
-  }
+  // it, the printer's first camera that is switched on (cameraStreamFor).
+  const name = await cameraStreamFor(req, user, pid);
   if (!name) return reply.code(404).send({ error: 'no WebRTC camera stream for this printer' });
   try {
     const res = await fetch(`${GO2RTC_URL}/api/webrtc?src=${encodeURIComponent(name)}`, {
@@ -2203,24 +2294,75 @@ app.get('/api/cameras', async (req, reply) => {
 // One JPEG from one of the caller's own camera streams. Only streams in the
 // caller's list are served, so this can never be used to make go2rtc pull an
 // arbitrary source.
-app.get('/api/cameras/frame.jpeg', async (req, reply) => {
-  const user = await callerFor(req, reply, 'read'); if (!user) return;
+// The caller's own camera called `src`, registered with go2rtc, or null after
+// answering the request. Only streams in the caller's list are served, so no
+// endpoint can make go2rtc pull an arbitrary source.
+async function ownCamera(req, reply, user) {
   const src = String(req.query?.src || '');
-  if (!/^[a-z0-9_]{1,80}$/i.test(src)) return reply.code(400).send({ error: 'src is a stream name from /api/cameras' });
+  if (!/^[a-z0-9_]{1,80}$/i.test(src)) { reply.code(400).send({ error: 'src is a stream name from /api/cameras' }); return null; }
   const ctx = await cameraCtx(user);
-  if (!ctx.base) return reply.code(409).send({ error: 'no running instance for this account' });
+  if (!ctx.base) { reply.code(409).send({ error: 'no running instance for this account' }); return null; }
   let mine;
   try { mine = (await cameraList(ctx, { withSource: true })).find((c) => c.stream_name === src); }
-  catch (e) { return reply.code(502).send({ error: 'engine unreachable: ' + e.message }); }
-  if (!mine || (mine.printer_id != null && !allows(await printerAccess(req.apiKey ? null : req, user), mine.printer_id))) return reply.code(404).send({ error: 'no such camera' });
-  if (!mine.enabled) return reply.code(409).send({ error: 'this camera is switched off' });
+  catch (e) { reply.code(502).send({ error: 'engine unreachable: ' + e.message }); return null; }
+  if (!mine || (mine.printer_id != null && !allows(await printerAccess(req.apiKey ? null : req, user), mine.printer_id))) { reply.code(404).send({ error: 'no such camera' }); return null; }
+  if (!mine.enabled) { reply.code(409).send({ error: 'this camera is switched off' }); return null; }
   // Registering is idempotent and cheap, and covers a go2rtc that restarted since the last sync.
   await registerStream(mine.stream_name, mine._source).catch(() => {});
+  return mine;
+}
+
+// One JPEG from one of the caller's own camera streams.
+app.get('/api/cameras/frame.jpeg', async (req, reply) => {
+  const user = await callerFor(req, reply, 'read'); if (!user) return;
+  const mine = await ownCamera(req, reply, user); if (!mine) return;
   const jpeg = await cameraFrame(mine.stream_name);
   if (!jpeg) return reply.code(502).send({ error: 'the camera did not return a frame' });
   reply.header('content-type', 'image/jpeg');
   reply.header('cache-control', 'no-cache, no-store, must-revalidate');
   return reply.send(jpeg);
+});
+
+// Live video of one of the caller's own cameras as HLS in fragmented MP4, which
+// iOS and Android play natively at the camera's own quality: go2rtc holds one
+// connection to the camera while anyone watches and passes the H.264 through.
+// The playlist's links are relative (hls/playlist.m3u8?id=...), so a player
+// that opened /api/cameras/stream.m3u8 fetches them from /api/cameras/hls/.
+app.get('/api/cameras/stream.m3u8', async (req, reply) => {
+  const user = await callerFor(req, reply, 'read'); if (!user) return;
+  const mine = await ownCamera(req, reply, user); if (!mine) return;
+  let r;
+  try { r = await fetch(`${GO2RTC_URL}/api/stream.m3u8?src=${encodeURIComponent(mine.stream_name)}&mp4`, { signal: AbortSignal.timeout(20000) }); }
+  catch (e) { return reply.code(502).send({ error: 'the camera did not start: ' + e.message }); }
+  if (!r.ok) return reply.code(502).send({ error: `the camera did not start (go2rtc HTTP ${r.status})` });
+  reply.header('content-type', 'application/vnd.apple.mpegurl');
+  reply.header('cache-control', 'no-cache, no-store, must-revalidate');
+  return reply.send(Buffer.from(await r.arrayBuffer()));
+});
+
+// The parts of a live view: its playlist, init segment and media segments.
+// go2rtc names each viewer's session with an unguessable id; only these files
+// and only id/n query parameters are passed on.
+const HLS_FILES = /^(playlist\.m3u8|init\.mp4|segment\.(m4s|ts))$/;
+app.get('/api/cameras/hls/:file', async (req, reply) => {
+  const user = await callerFor(req, reply, 'read'); if (!user) return;
+  const file = String(req.params.file || '');
+  if (!HLS_FILES.test(file)) return reply.code(404).send({ error: 'no such file' });
+  const q = new URLSearchParams();
+  for (const k of ['id', 'n']) {
+    const v = req.query?.[k];
+    if (v == null) continue;
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(String(v))) return reply.code(400).send({ error: `bad ${k}` });
+    q.set(k, String(v));
+  }
+  if (!q.get('id')) return reply.code(400).send({ error: 'id is required' });
+  let r;
+  try { r = await fetch(`${GO2RTC_URL}/api/hls/${file}?${q}`, { signal: AbortSignal.timeout(20000) }); }
+  catch (e) { return reply.code(502).send({ error: 'go2rtc unreachable: ' + e.message }); }
+  if (!r.ok) return reply.code(r.status === 404 ? 404 : 502).send({ error: `go2rtc HTTP ${r.status}` });
+  reply.header('content-type', r.headers.get('content-type') || (file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp4'));
+  reply.header('cache-control', 'no-cache, no-store, must-revalidate');
+  return reply.send(Buffer.from(await r.arrayBuffer()));
 });
 
 app.post('/api/cameras', async (req, reply) => {

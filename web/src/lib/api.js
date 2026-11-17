@@ -387,6 +387,10 @@ export const api = {
   resetSlot: (id, amsId, trayId) =>
     req('/engine/api/v1/printers/' + id + '/ams/' + amsId + '/tray/' + trayId + '/reset', { method: 'POST' }),
   queue: () => req('/engine/api/v1/queue/'),
+  // Filament matching: how close the loaded filament must be before a job starts.
+  filamentMatchSettings: () => req('/engine/api/v1/filament-matching/settings'),
+  setFilamentMatchSettings: (body) =>
+    req('/engine/api/v1/filament-matching/settings', { method: 'PUT', body: JSON.stringify(body) }),
   queueUpdate: (id, body) =>
     req('/engine/api/v1/queue/' + id, { method: 'PATCH', body: JSON.stringify(body) }),
   queueDelete: (id) => req('/engine/api/v1/queue/' + id, { method: 'DELETE' }),
@@ -428,6 +432,10 @@ export const api = {
   // the key OrcaSlicer uses to send plates here as an OctoPrint print host.
   slicerInfo: () => req('/slicer/info'),
   slicerPrintHostKey: () => req('/slicer/printhost-key', { method: 'POST' }),
+  // Open a library file in the person's OrcaSlicer desktop (B49).
+  desktopOpen: (fileId, name) => req('/slicer/desktop-open', { method: 'POST', body: JSON.stringify({ file_id: fileId, name }) }),
+  // The printers ArtisanHub Link sees at printer sites (B48): what a scan from a cloud farm cannot find.
+  linkPrinters: () => req('/link/printers'),
   // Compatible process/filament preset names for a printer (control-plane join).
   compatiblePresets: (printer) => req('/slicer/compatible?printer=' + encodeURIComponent(printer)),
   // Bambu HMS error dictionary (short_code -> description) for decoding alerts.
